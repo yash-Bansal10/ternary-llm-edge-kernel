@@ -1,0 +1,4 @@
+Metric,Baseline (Standard MAC),Optimized (Bit-Serial Popcount)
+Total Cycles (simTicks),7595085000,5948525000
+Latency (simSeconds),0.007595,0.005949
+D-Cache Misses,N/A,N/A
