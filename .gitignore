@@ -1,0 +1,28 @@
+# Ignored Project Folders
+A complete Roadmap with questions/
+Phase-7*/
+Phase-8*/
+Phase-9*/
+Phase-10*/
+Phase-11*/
+Phase-12*/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C++ Build Artifacts
+*.o
+*.out
+*.bin
+*.exe
+
+# Simulation/Data Logs
+m5out/
+*.log
+*.csv
+
+# OS Generated Files
+.DS_Store
+Thumbs.db
