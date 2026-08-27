@@ -40,7 +40,12 @@ struct PackedLayer {
     int rows, cols, words_per_row;
 };
 
-// Generate Random Packed Masks (Simulating the loaded .bin file)
+// Dense Layer (For Baseline A)
+struct DenseLayer {
+    vector<vector<int8_t>> weights;
+};
+
+// Generate Random Packed Masks
 PackedLayer generate_random_layer(const LayerShape& shape) {
     PackedLayer layer;
     layer.rows = shape.rows;
@@ -56,13 +61,28 @@ PackedLayer generate_random_layer(const LayerShape& shape) {
         for(int w = 0; w < shape.words_per_row; w++) {
             uint32_t p = dist(rng);
             uint32_t n = dist(rng);
-            // Ensure pos and neg bits don't overlap (value can't be both +1 and -1)
             n &= ~p; 
             layer.pos_masks[r][w] = p;
             layer.neg_masks[r][w] = n;
         }
     }
     return layer;
+}
+
+// Unpack PackedLayer to DenseLayer for Baseline A
+DenseLayer unpack_to_dense(const PackedLayer& packed) {
+    DenseLayer dense;
+    dense.weights.resize(packed.rows, vector<int8_t>(packed.cols));
+    for(int r = 0; r < packed.rows; r++) {
+        for(int c = 0; c < packed.cols; c++) {
+            int w = c / 32;
+            int bit = c % 32;
+            int p = (packed.pos_masks[r][w] >> bit) & 1;
+            int n = (packed.neg_masks[r][w] >> bit) & 1;
+            dense.weights[r][c] = p - n;
+        }
+    }
+    return dense;
 }
 
 // Generate Random INT8 Activations (64 sets)
@@ -78,7 +98,7 @@ vector<vector<int8_t>> generate_activations(int cols) {
     return acts;
 }
 
-// Global Preallocated Activation Bitplanes (8 planes x words_per_row)
+// Global Preallocated Activation Bitplanes
 vector<vector<uint32_t>> act_planes(8);
 
 // Pack INT8 to 8 Bitplanes
@@ -86,7 +106,6 @@ void pack_activations(const vector<int8_t>& acts, int words_per_row) {
     for(int b = 0; b < 8; b++) {
         fill(act_planes[b].begin(), act_planes[b].end(), 0);
     }
-    
     for(int w = 0; w < words_per_row; w++) {
         for(int bit = 0; bit < 32; bit++) {
             int c = w * 32 + bit;
@@ -97,6 +116,33 @@ void pack_activations(const vector<int8_t>& acts, int words_per_row) {
                 }
             }
         }
+    }
+}
+
+// Baseline A: Dense INT8 Ternary MAC
+void run_baseline_a(const DenseLayer& layer, const vector<int8_t>& acts, vector<int>& output) {
+    for(int r = 0; r < layer.weights.size(); r++) {
+        int acc = 0;
+        for(int c = 0; c < acts.size(); c++) {
+            acc += layer.weights[r][c] * acts[c];
+        }
+        output[r] = acc;
+    }
+}
+
+// Baseline B: Scalar On-the-Fly Packed Decoding
+void run_baseline_b(const PackedLayer& layer, const vector<int8_t>& acts, vector<int>& output) {
+    for(int r = 0; r < layer.rows; r++) {
+        int acc = 0;
+        for(int c = 0; c < layer.cols; c++) {
+            int w = c / 32;
+            int bit = c % 32;
+            int p = (layer.pos_masks[r][w] >> bit) & 1;
+            int n = (layer.neg_masks[r][w] >> bit) & 1;
+            int weight = p - n;
+            acc += weight * acts[c];
+        }
+        output[r] = acc;
     }
 }
 
@@ -121,7 +167,7 @@ void run_bit_serial_kernel(const PackedLayer& layer, vector<int>& output) {
 // Benchmark Runner
 void run_benchmark() {
     ofstream csv_file("benchmark_raw_arm64.csv");
-    csv_file << "layer,trial,activation_pack_us,proposed_kernel_us,proposed_total_us\n";
+    csv_file << "layer,trial,baseline_a_us,baseline_b_us,activation_pack_us,proposed_kernel_us,proposed_total_us\n";
 
     cout << "========================================================\n";
     cout << "  V5 Mobile Benchmark: Bit-Serial Popcount (Cortex-A55) \n";
@@ -130,68 +176,89 @@ void run_benchmark() {
     for(const auto& shape : layers) {
         cout << "Initializing layer: " << shape.name << "..." << flush;
         PackedLayer layer = generate_random_layer(shape);
+        DenseLayer dense_layer = unpack_to_dense(layer);
         vector<vector<int8_t>> act_sets = generate_activations(shape.cols);
         
-        // Preallocate
         for(int b = 0; b < 8; b++) act_planes[b].resize(shape.words_per_row);
         vector<int> output(shape.rows);
         cout << " Done.\n";
 
         // Warmup
         for(int i = 0; i < WARMUP_ROUNDS; i++) {
+            run_baseline_a(dense_layer, act_sets[i % ACTIVATION_SETS], output);
+            run_baseline_b(layer, act_sets[i % ACTIVATION_SETS], output);
             pack_activations(act_sets[i % ACTIVATION_SETS], shape.words_per_row);
             run_bit_serial_kernel(layer, output);
         }
 
-        vector<double> pack_times, kernel_times, total_times;
+        vector<double> base_a_times, base_b_times, pack_times, kernel_times, total_times;
 
         // Measured Trials
         for(int t = 0; t < MEASURED_TRIALS; t++) {
-            double trial_pack = 0, trial_kernel = 0, trial_total = 0;
+            double trial_base_a = 0, trial_base_b = 0, trial_pack = 0, trial_kernel = 0;
             
             for(int r = 0; r < INNER_REPS; r++) {
                 int s = (t * INNER_REPS + r) % ACTIVATION_SETS;
                 
-                // 1. Time Pack
-                auto start = high_resolution_clock::now();
+                // 1. Time Baseline A
+                auto start_a = high_resolution_clock::now();
+                run_baseline_a(dense_layer, act_sets[s], output);
+                auto end_a = high_resolution_clock::now();
+
+                // 2. Time Baseline B
+                auto start_b = high_resolution_clock::now();
+                run_baseline_b(layer, act_sets[s], output);
+                auto end_b = high_resolution_clock::now();
+
+                // 3. Time Pack
+                auto start_pack = high_resolution_clock::now();
                 pack_activations(act_sets[s], shape.words_per_row);
                 auto end_pack = high_resolution_clock::now();
                 
-                // 2. Time Kernel
+                // 4. Time Kernel
                 auto start_k = high_resolution_clock::now();
                 run_bit_serial_kernel(layer, output);
                 auto end_k = high_resolution_clock::now();
                 
-                // 3. Direct Total (Simulated by adding for now to avoid disrupting loop)
-                // In actual V5 they used interleaved timings, but this gives the raw speed.
-                
-                trial_pack += duration_cast<nanoseconds>(end_pack - start).count() / 1000.0;
+                trial_base_a += duration_cast<nanoseconds>(end_a - start_a).count() / 1000.0;
+                trial_base_b += duration_cast<nanoseconds>(end_b - start_b).count() / 1000.0;
+                trial_pack += duration_cast<nanoseconds>(end_pack - start_pack).count() / 1000.0;
                 trial_kernel += duration_cast<nanoseconds>(end_k - start_k).count() / 1000.0;
             }
             
+            base_a_times.push_back(trial_base_a / INNER_REPS);
+            base_b_times.push_back(trial_base_b / INNER_REPS);
             pack_times.push_back(trial_pack / INNER_REPS);
             kernel_times.push_back(trial_kernel / INNER_REPS);
             total_times.push_back((trial_pack + trial_kernel) / INNER_REPS);
 
             csv_file << shape.name << "," << t << "," 
+                     << (trial_base_a / INNER_REPS) << ","
+                     << (trial_base_b / INNER_REPS) << ","
                      << (trial_pack / INNER_REPS) << ","
                      << (trial_kernel / INNER_REPS) << ","
                      << ((trial_pack + trial_kernel) / INNER_REPS) << "\n";
         }
 
         // Calculate Medians
+        sort(base_a_times.begin(), base_a_times.end());
+        sort(base_b_times.begin(), base_b_times.end());
         sort(pack_times.begin(), pack_times.end());
         sort(kernel_times.begin(), kernel_times.end());
         sort(total_times.begin(), total_times.end());
 
+        double median_base_a = base_a_times[MEASURED_TRIALS / 2];
+        double median_base_b = base_b_times[MEASURED_TRIALS / 2];
         double median_pack = pack_times[MEASURED_TRIALS / 2];
         double median_kernel = kernel_times[MEASURED_TRIALS / 2];
         double median_total = total_times[MEASURED_TRIALS / 2];
 
         cout << "Results for " << shape.name << ":\n";
-        cout << "  -> Median Pack Time:   " << fixed << setprecision(2) << median_pack << " us\n";
-        cout << "  -> Median Kernel Time: " << median_kernel << " us\n";
-        cout << "  -> Median Total Time:  " << median_total << " us\n";
+        cout << "  -> Median Baseline A Time: " << fixed << setprecision(2) << median_base_a << " us\n";
+        cout << "  -> Median Baseline B Time: " << median_base_b << " us\n";
+        cout << "  -> Median Pack Time:       " << median_pack << " us\n";
+        cout << "  -> Median Kernel Time:     " << median_kernel << " us\n";
+        cout << "  -> Median Total Time:      " << median_total << " us\n";
         cout << "--------------------------------------------------------\n";
     }
     
