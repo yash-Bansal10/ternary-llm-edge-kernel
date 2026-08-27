@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <iomanip>
 #include <numeric>
+#include <fstream>
 
 // Standard POPCOUNT macro
 #define POPCOUNT __builtin_popcount
@@ -119,6 +120,9 @@ void run_bit_serial_kernel(const PackedLayer& layer, vector<int>& output) {
 
 // Benchmark Runner
 void run_benchmark() {
+    ofstream csv_file("benchmark_raw_arm64.csv");
+    csv_file << "layer,trial,activation_pack_us,proposed_kernel_us,proposed_total_us\n";
+
     cout << "========================================================\n";
     cout << "  V5 Mobile Benchmark: Bit-Serial Popcount (Cortex-A55) \n";
     cout << "========================================================\n\n";
@@ -168,6 +172,11 @@ void run_benchmark() {
             pack_times.push_back(trial_pack / INNER_REPS);
             kernel_times.push_back(trial_kernel / INNER_REPS);
             total_times.push_back((trial_pack + trial_kernel) / INNER_REPS);
+
+            csv_file << shape.name << "," << t << "," 
+                     << (trial_pack / INNER_REPS) << ","
+                     << (trial_kernel / INNER_REPS) << ","
+                     << ((trial_pack + trial_kernel) / INNER_REPS) << "\n";
         }
 
         // Calculate Medians
@@ -185,6 +194,9 @@ void run_benchmark() {
         cout << "  -> Median Total Time:  " << median_total << " us\n";
         cout << "--------------------------------------------------------\n";
     }
+    
+    csv_file.close();
+    cout << "Data saved to benchmark_raw_arm64.csv\n";
 }
 
 int main() {
